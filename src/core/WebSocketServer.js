@@ -4,7 +4,8 @@ import { AuthController } from "../controllers/AuthController.js";
 
 export class WebSocketServer {
   constructor(server) {
-    this.clients = new Map();
+    this.clients = new Map(); // Map<WebSocket, {userId, roomId}>
+    this.rooms = new Map(); // Map<roomId, Set<userId>>
     this.jwt = new JwtUtil();
     this.wss = new WSS({ server });
     this.init();
@@ -12,61 +13,167 @@ export class WebSocketServer {
 
   init() {
     this.wss.on("connection", (ws) => {
+      console.log("New WebSocket connection");
+
       ws.on("message", async (message) => {
         let data;
         try {
           data = JSON.parse(message);
-        } catch {
+        } catch (error) {
+          console.error("Invalid JSON:", error);
           return;
         }
 
-        const { type, token, payload } = data;
+        const { type, token, payload, from } = data;
+        console.log("Received message:", { type, from, payload });
 
+        // Handle authentication
         if (["LOGIN", "REGISTER"].includes(type)) {
           const auth = new AuthController(ws);
           await auth.handle(type, payload);
           return;
         }
 
+        // Verify JWT token for protected routes
         const user = this.jwt.verify(token);
-        if (!user) return ws.send(JSON.stringify({ type: "UNAUTHORIZED" }));
-
-        if (type === "JOIN_ROOM") {
-          this.clients.set(ws, { userId: user.id, roomId: payload.roomId });
-          ws.send(JSON.stringify({ type: "JOINED_ROOM", roomId: payload.roomId }));
-          this.broadcast(payload.roomId, {
-            type: "USER_JOINED",
-            userId: user.id,
-          }, ws);
+        if (!user) {
+          console.log("Unauthorized access attempt");
+          return ws.send(JSON.stringify({ type: "UNAUTHORIZED" }));
         }
 
-        if (type === "SIGNAL") {
-          this.broadcast(payload.roomId, {
-            type: "SIGNAL",
+        // Handle room joining
+        if (type === "JOIN_ROOM") {
+          const { roomId } = payload;
+          
+          // Store client metadata
+          this.clients.set(ws, { userId: user.id, roomId });
+          
+          // Add user to room
+          if (!this.rooms.has(roomId)) {
+            this.rooms.set(roomId, new Set());
+          }
+          this.rooms.get(roomId).add(user.id);
+
+          // Confirm room join to the user
+          ws.send(JSON.stringify({ 
+            type: "JOINED_ROOM", 
+            roomId,
+            userId: user.id 
+          }));
+
+          // Notify other users in the room
+          this.broadcast(roomId, {
+            type: "USER_JOINED",
             from: user.id,
-            signal: payload.signal,
+            userId: user.id,
           }, ws);
+
+          console.log(`User ${user.id} joined room ${roomId}`);
+          console.log(`Room ${roomId} now has users:`, Array.from(this.rooms.get(roomId)));
+        }
+
+        // Handle WebRTC signaling
+        if (type === "SIGNAL") {
+          const { roomId, to, signal } = payload;
+          
+          // If 'to' is specified, send to specific user, otherwise broadcast to room
+          if (to) {
+            this.sendToUser(to, {
+              type: "SIGNAL",
+              from: user.id,
+              payload: { signal, roomId }
+            });
+          } else {
+            this.broadcast(roomId, {
+              type: "SIGNAL",
+              from: user.id,
+              payload: { signal, roomId }
+            }, ws);
+          }
+          
+          console.log(`Signal from ${user.id} to ${to || 'room'}`);
         }
       });
 
       ws.on("close", () => {
-        const meta = this.clients.get(ws);
-        if (meta) {
-          this.broadcast(meta.roomId, {
+        console.log("WebSocket connection closed");
+        const clientData = this.clients.get(ws);
+        
+        if (clientData) {
+          const { userId, roomId } = clientData;
+          
+          // Remove from room
+          if (this.rooms.has(roomId)) {
+            this.rooms.get(roomId).delete(userId);
+            
+            // Clean up empty rooms
+            if (this.rooms.get(roomId).size === 0) {
+              this.rooms.delete(roomId);
+            }
+          }
+          
+          // Notify other users
+          this.broadcast(roomId, {
             type: "USER_LEFT",
-            userId: meta.userId,
+            userId,
+            from: userId
           });
+          
+          // Remove client
           this.clients.delete(ws);
+          
+          console.log(`User ${userId} left room ${roomId}`);
         }
+      });
+
+      ws.on("error", (error) => {
+        console.error("WebSocket error:", error);
       });
     });
   }
 
-  broadcast(roomId, message, excludeWs = null) {
+  // Send message to specific user
+  sendToUser(userId, message) {
     for (const [client, meta] of this.clients.entries()) {
-      if (meta.roomId === roomId && client !== excludeWs) {
+      if (meta.userId === userId && client.readyState === client.OPEN) {
         client.send(JSON.stringify(message));
+        return true;
       }
     }
+    return false;
+  }
+
+  // Broadcast message to all users in a room except sender
+  broadcast(roomId, message, excludeWs = null) {
+    let sentCount = 0;
+    
+    for (const [client, meta] of this.clients.entries()) {
+      if (meta.roomId === roomId && 
+          client !== excludeWs && 
+          client.readyState === client.OPEN) {
+        client.send(JSON.stringify(message));
+        sentCount++;
+      }
+    }
+    
+    console.log(`Broadcasted to ${sentCount} clients in room ${roomId}`);
+    return sentCount;
+  }
+
+  // Get active users in a room
+  getRoomUsers(roomId) {
+    return this.rooms.get(roomId) || new Set();
+  }
+
+  // Get room statistics
+  getRoomStats() {
+    const stats = {};
+    for (const [roomId, users] of this.rooms.entries()) {
+      stats[roomId] = {
+        userCount: users.size,
+        users: Array.from(users)
+      };
+    }
+    return stats;
   }
 }
