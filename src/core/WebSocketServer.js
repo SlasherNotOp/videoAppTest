@@ -45,14 +45,19 @@ export class WebSocketServer {
         if (type === "JOIN_ROOM") {
           const { roomId } = payload;
           
-          // Store client metadata
+          // Store client metadata with unique session handling
           this.clients.set(ws, { userId: user.id, roomId });
           
-          // Add user to room
+          // Add user to room (allow multiple sessions per user)
           if (!this.rooms.has(roomId)) {
-            this.rooms.set(roomId, new Set());
+            this.rooms.set(roomId, new Map()); // Map<userId, Set<WebSocket>>
           }
-          this.rooms.get(roomId).add(user.id);
+          
+          const roomUsers = this.rooms.get(roomId);
+          if (!roomUsers.has(user.id)) {
+            roomUsers.set(user.id, new Set());
+          }
+          roomUsers.get(user.id).add(ws);
 
           // Confirm room join to the user
           ws.send(JSON.stringify({ 
@@ -61,7 +66,7 @@ export class WebSocketServer {
             userId: user.id 
           }));
 
-          // Notify other users in the room
+          // Notify other users in the room (broadcast to all sessions)
           this.broadcast(roomId, {
             type: "USER_JOINED",
             from: user.id,
@@ -69,7 +74,7 @@ export class WebSocketServer {
           }, ws);
 
           console.log(`User ${user.id} joined room ${roomId}`);
-          console.log(`Room ${roomId} now has users:`, Array.from(this.rooms.get(roomId)));
+          console.log(`Room ${roomId} now has users:`, Array.from(roomUsers.keys()));
         }
 
         // Handle WebRTC signaling
@@ -102,27 +107,35 @@ export class WebSocketServer {
         if (clientData) {
           const { userId, roomId } = clientData;
           
-          // Remove from room
+          // Remove this specific WebSocket from room
           if (this.rooms.has(roomId)) {
-            this.rooms.get(roomId).delete(userId);
-            
-            // Clean up empty rooms
-            if (this.rooms.get(roomId).size === 0) {
-              this.rooms.delete(roomId);
+            const roomUsers = this.rooms.get(roomId);
+            if (roomUsers.has(userId)) {
+              roomUsers.get(userId).delete(ws);
+              
+              // If user has no more active sessions, remove them completely
+              if (roomUsers.get(userId).size === 0) {
+                roomUsers.delete(userId);
+                
+                // Notify other users that this user left completely
+                this.broadcast(roomId, {
+                  type: "USER_LEFT",
+                  userId,
+                  from: userId
+                });
+              }
+              
+              // Clean up empty rooms
+              if (roomUsers.size === 0) {
+                this.rooms.delete(roomId);
+              }
             }
           }
-          
-          // Notify other users
-          this.broadcast(roomId, {
-            type: "USER_LEFT",
-            userId,
-            from: userId
-          });
           
           // Remove client
           this.clients.delete(ws);
           
-          console.log(`User ${userId} left room ${roomId}`);
+          console.log(`User ${userId} session disconnected from room ${roomId}`);
         }
       });
 
@@ -162,16 +175,22 @@ export class WebSocketServer {
 
   // Get active users in a room
   getRoomUsers(roomId) {
-    return this.rooms.get(roomId) || new Set();
+    const roomUsers = this.rooms.get(roomId);
+    return roomUsers ? Array.from(roomUsers.keys()) : [];
   }
 
   // Get room statistics
   getRoomStats() {
     const stats = {};
-    for (const [roomId, users] of this.rooms.entries()) {
+    for (const [roomId, userMap] of this.rooms.entries()) {
+      const users = Array.from(userMap.keys());
+      const totalSessions = Array.from(userMap.values())
+        .reduce((sum, sessions) => sum + sessions.size, 0);
+      
       stats[roomId] = {
-        userCount: users.size,
-        users: Array.from(users)
+        userCount: users.length,
+        sessionCount: totalSessions,
+        users: users
       };
     }
     return stats;

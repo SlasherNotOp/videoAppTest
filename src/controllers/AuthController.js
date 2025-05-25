@@ -9,7 +9,14 @@ export class AuthController {
   async handle(type, payload) {
     if (type === "REGISTER") {
       const user = await this.authService.register(payload.email, payload.password);
-      this.ws.send(JSON.stringify({ type: "REGISTER_SUCCESS", user }));
+      // this.ws.send(JSON.stringify({ type: "REGISTER_SUCCESS", user }));
+      const result = await this.authService.login(user.email, user.password);
+      if (!result) {
+        this.ws.send(JSON.stringify({ type: "LOGIN_FAILED" }));
+      } else {
+        this.ws.send(JSON.stringify({ type: "LOGIN_SUCCESS", token: result.token }));
+      }
+
     }
 
     if (type === "LOGIN") {
